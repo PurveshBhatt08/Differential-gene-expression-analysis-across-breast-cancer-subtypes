@@ -1,0 +1,562 @@
+
+# Differential Gene Expression Analysis Across Breast Cancer Subtypes
+# Dataset: GSE65194 (NCBI GEO)
+# Genes: TP53, CDK4, CCND1, BAX, BCL2, CASP3
+# Subtypes: Luminal A, Luminal B, HER2-enriched, Triple-Negative
+# Author: Purvesh
+# College: Thakur College of Science and Commerce, Mumbai
+# Project: Final Year B.Sc. Biotechnology Black Book Project
+
+
+
+
+# STEP 1: Install and Load Required Packages
+
+# Install packages if not already installed
+required_packages <- c("GEOquery", "limma", "ggplot2", "pheatmap", "dplyr", "tidyr", "RColorBrewer", "ggrepel")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (pkg %in% c("GEOquery", "limma")) {
+      if (!requireNamespace("BiocManager", quietly = TRUE))
+        install.packages("BiocManager")
+      BiocManager::install(pkg)
+    } else {
+      install.packages(pkg)
+    }
+  }
+}
+
+# Load all libraries
+library(GEOquery)
+library(limma)
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+library(ggrepel)
+
+
+# STEP 2: Download and Load Dataset from GEO
+
+# Download GSE65194 from NCBI GEO
+# This may take a few minutes depending on your internet speed
+gse <- getGEO("GSE65194", GSEMatrix = TRUE, AnnotGPL = TRUE)
+
+# Extract the expression set
+eset <- gse[[1]]
+
+# Preview the data
+cat("Dataset dimensions:", dim(exprs(eset)), "\n")
+cat("Number of samples:", ncol(exprs(eset)), "\n")
+cat("Number of probes:", nrow(exprs(eset)), "\n")
+
+# STEP 3: Extract Sample Metadata and Define Subtypes
+
+
+# Get phenotype data
+pheno <- pData(eset)
+
+# View available columns to find subtype information
+cat("Available metadata columns:\n")
+print(colnames(pheno))
+
+# Extract subtype information
+# GSE65194 contains subtype info — adjust column name if needed after viewing above
+# Common column names: "characteristics_ch1", "subtype:ch1", etc.
+
+# Checking characteristics in columns
+print(head(pheno[, grep("characteristics", colnames(pheno))]))
+
+# Extract subtype from characteristics
+# GSE65194 subtypes are typically in characteristics_ch1.1 or similar
+subtype_col <- grep("subtype|characteristics_ch1", colnames(pheno), 
+                    value = TRUE, ignore.case = TRUE)
+
+cat("Subtype-related columns found:", subtype_col, "\n")
+
+# Build a clean sample info dataframe
+sample_info <- data.frame(
+  sample_id  = rownames(pheno),
+  subtype_raw = as.character(pheno[[subtype_col[1]]])
+)
+
+# Clean and standardize subtype labels
+sample_info$subtype <- NA
+sample_info$subtype[grepl("luminal a|LumA", sample_info$subtype_raw, 
+                           ignore.case = TRUE)] <- "Luminal_A"
+sample_info$subtype[grepl("luminal b|LumB", sample_info$subtype_raw, 
+                           ignore.case = TRUE)] <- "Luminal_B"
+sample_info$subtype[grepl("her2|HER2", sample_info$subtype_raw, 
+                           ignore.case = TRUE)] <- "HER2_Enriched"
+sample_info$subtype[grepl("triple|TNBC|basal", sample_info$subtype_raw, 
+                           ignore.case = TRUE)] <- "Triple_Negative"
+
+# Remove samples with unknown subtype
+sample_info <- sample_info[!is.na(sample_info$subtype), ]
+cat("Samples per subtype:\n")
+print(table(sample_info$subtype))
+
+# Subset expression set to only labeled samples
+eset_filtered <- eset[, sample_info$sample_id]
+
+
+# STEP 4: Extract Expression Data for Six Target Genes
+
+
+# Get feature (probe) annotation
+feature_data <- fData(eset_filtered)
+cat("Feature annotation columns:\n")
+print(colnames(feature_data))
+
+# Find the gene symbol column
+gene_col <- grep("Gene.symbol|gene_symbol|Symbol|GENE_SYMBOL", 
+                 colnames(feature_data), value = TRUE, ignore.case = TRUE)[1]
+cat("Gene symbol column identified:", gene_col, "\n")
+
+# Target genes
+target_genes <- c("TP53", "CDK4", "CCND1", "BAX", "BCL2", "CASP3")
+
+# Find probes matching target genes
+# Handle multiple probes per gene by keeping the one with highest mean expression
+expr_matrix <- exprs(eset_filtered)
+
+gene_expr_list <- list()
+
+for (gene in target_genes) {
+  # Find probes for this gene
+  probe_idx <- which(grepl(paste0("^", gene, "$"), 
+                            feature_data[[gene_col]], ignore.case = TRUE))
+  
+  if (length(probe_idx) == 0) {
+    # Try partial match
+    probe_idx <- which(grepl(gene, feature_data[[gene_col]], ignore.case = TRUE))
+  }
+  
+  if (length(probe_idx) > 0) {
+    if (length(probe_idx) == 1) {
+      gene_expr_list[[gene]] <- expr_matrix[probe_idx, ]
+    } else {
+      # Multiple probes — pick highest mean expression
+      probe_means <- rowMeans(expr_matrix[probe_idx, ])
+      best_probe  <- probe_idx[which.max(probe_means)]
+      gene_expr_list[[gene]] <- expr_matrix[best_probe, ]
+      cat("Gene", gene, "— multiple probes found, selected probe with highest mean.\n")
+    }
+  } else {
+    cat("WARNING: Gene", gene, "not found in annotation.\n")
+  }
+}
+
+# Combine into a clean expression dataframe
+gene_expr_df <- as.data.frame(do.call(rbind, gene_expr_list))
+gene_expr_df$gene <- rownames(gene_expr_df)
+
+cat("\nGenes successfully extracted:", rownames(gene_expr_df), "\n")
+
+
+
+# STEP 5: Differential Expression Analysis Using limma
+
+
+# Subset expression matrix to target genes only
+expr_target <- as.matrix(gene_expr_df[, -ncol(gene_expr_df)])
+
+# Create design matrix
+subtype_factor <- factor(sample_info$subtype,
+                         levels = c("Luminal_A", "Luminal_B",
+                                    "HER2_Enriched", "Triple_Negative"))
+
+design <- model.matrix(~ 0 + subtype_factor)
+colnames(design) <- levels(subtype_factor)
+
+cat("\nDesign matrix columns:", colnames(design), "\n")
+
+# Fit linear model
+fit <- lmFit(expr_target, design)
+
+# Define contrasts — compare each subtype to Luminal A as reference
+contrast_matrix <- makeContrasts(
+  LumB_vs_LumA    = Luminal_B     - Luminal_A,
+  HER2_vs_LumA    = HER2_Enriched - Luminal_A,
+  TNBC_vs_LumA    = Triple_Negative - Luminal_A,
+  HER2_vs_LumB    = HER2_Enriched - Luminal_B,
+  TNBC_vs_LumB    = Triple_Negative - Luminal_B,
+  TNBC_vs_HER2    = Triple_Negative - HER2_Enriched,
+  levels = design)
+
+# Apply contrasts and run eBayes
+fit2    <- contrasts.fit(fit, contrast_matrix)
+fit2    <- eBayes(fit2)
+
+# Extract results for each contrast
+cat("\n--- Differential Expression Results ---\n")
+contrast_names <- colnames(contrast_matrix)
+
+results_list <- list()
+for (ct in contrast_names) {
+  res <- topTable(fit2, coef = ct, number = Inf, sort.by = "P")
+  res$contrast <- ct
+  res$gene     <- rownames(res)
+  results_list[[ct]] <- res
+  cat("\nContrast:", ct, "\n")
+  print(res[, c("gene", "logFC", "AveExpr", "P.Value", "adj.P.Val")])
+}
+
+# Combine all results
+all_results <- do.call(rbind, results_list)
+rownames(all_results) <- NULL
+
+
+
+# STEP 6: Prepare Long Format Data for Plotting
+
+# Melt expression data to long format
+expr_long <- gene_expr_df %>%
+  pivot_longer(cols = -gene, names_to = "sample_id", values_to = "expression")
+
+# Merge with subtype info
+expr_long <- expr_long %>%
+  left_join(sample_info[, c("sample_id", "subtype")], by = "sample_id")
+
+# Set factor levels for consistent ordering
+expr_long$subtype <- factor(expr_long$subtype,
+                             levels = c("Luminal_A", "Luminal_B",
+                                        "HER2_Enriched", "Triple_Negative"))
+expr_long$gene <- factor(expr_long$gene, levels = target_genes)
+
+# Subtype color palette
+subtype_colors <- c(
+  "Luminal_A"       = "#2196F3",
+  "Luminal_B"       = "#4CAF50",
+  "HER2_Enriched"   = "#FF9800",
+  "Triple_Negative" = "#F44336"
+)
+
+
+
+# STEP 7: FIGURE 1 — Boxplots for Each Gene Across Subtypes
+
+cat("\nGenerating Figure 1: Boxplots...\n")
+
+fig1 <- ggplot(expr_long, aes(x = subtype, y = expression, fill = subtype)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 1.5, alpha = 0.85) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = subtype_colors) +
+  labs(
+    title    = "Gene Expression Across Breast Cancer Subtypes",
+    subtitle = "Genes: TP53, CDK4, CCND1, BAX, BCL2, CASP3 | Dataset: GSE65194",
+    x        = "Breast Cancer Subtype",
+    y        = "Expression (log2)",
+    fill     = "Subtype"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x      = element_text(angle = 35, hjust = 1, size = 9),
+    strip.background = element_rect(fill = "#E3F2FD"),
+    strip.text       = element_text(face = "bold", size = 10),
+    plot.title       = element_text(face = "bold", size = 13),
+    legend.position  = "bottom"
+  )
+
+ggsave("figures/Figure1_Boxplots.png", fig1, width = 12, height = 8, dpi = 300)
+cat("Figure 1 saved.\n")
+
+
+
+# STEP 8: FIGURE 2 — Violin Plots
+
+
+cat("Generating Figure 2: Violin plots...\n")
+
+fig2 <- ggplot(expr_long, aes(x = subtype, y = expression, fill = subtype)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = subtype_colors) +
+  labs(
+    title    = "Expression Distribution Across Subtypes (Violin Plot)",
+    subtitle = "Dataset: GSE65194",
+    x        = "Subtype",
+    y        = "Expression (log2)",
+    fill     = "Subtype"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x     = element_text(angle = 35, hjust = 1, size = 9),
+    strip.text      = element_text(face = "bold"),
+    plot.title      = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+ggsave("figures/Figure2_ViolinPlots.png", fig2, width = 12, height = 8, dpi = 300)
+cat("Figure 2 saved.\n")
+
+
+
+# STEP 9: FIGURE 3 — Bar Chart of Mean Expression per Subtype
+
+
+cat("Generating Figure 3: Bar charts...\n")
+
+mean_expr <- expr_long %>%
+  group_by(gene, subtype) %>%
+  summarise(
+    mean_expr = mean(expression, na.rm = TRUE),
+    se_expr   = sd(expression, na.rm = TRUE) / sqrt(n()),
+    .groups   = "drop"
+  )
+
+fig3 <- ggplot(mean_expr, aes(x = subtype, y = mean_expr, fill = subtype)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.85) +
+  geom_errorbar(aes(ymin = mean_expr - se_expr, ymax = mean_expr + se_expr),
+                width = 0.25, linewidth = 0.6) +
+  facet_wrap(~ gene, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = subtype_colors) +
+  labs(
+    title    = "Mean Gene Expression per Breast Cancer Subtype",
+    subtitle = "Error bars represent standard error | Dataset: GSE65194",
+    x        = "Subtype",
+    y        = "Mean Expression (log2)",
+    fill     = "Subtype"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x     = element_text(angle = 35, hjust = 1, size = 9),
+    strip.text      = element_text(face = "bold"),
+    plot.title      = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+ggsave("figures/Figure3_BarCharts.png", fig3, width = 12, height = 8, dpi = 300)
+cat("Figure 3 saved.\n")
+
+
+
+# STEP 10: FIGURE 4 — Heatmap of All Six Genes Across All Samples
+
+cat("Generating Figure 4: Heatmap (all samples)...\n")
+
+# Prepare matrix for heatmap
+heatmap_matrix <- as.matrix(gene_expr_df[, sample_info$sample_id])
+rownames(heatmap_matrix) <- gene_expr_df$gene
+
+# Scale rows (z-score per gene)
+heatmap_scaled <- t(scale(t(heatmap_matrix)))
+
+# Annotation for columns (samples)
+col_annotation <- data.frame(Subtype = sample_info$subtype)
+rownames(col_annotation) <- sample_info$sample_id
+
+annotation_colors <- list(Subtype = subtype_colors)
+
+png("figures/Figure4_Heatmap_AllSamples.png", width = 14, height = 5,
+    units = "in", res = 300)
+pheatmap(
+  heatmap_scaled,
+  annotation_col   = col_annotation,
+  annotation_colors = annotation_colors,
+  cluster_rows     = TRUE,
+  cluster_cols     = TRUE,
+  show_colnames    = FALSE,
+  fontsize_row     = 11,
+  color            = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  main             = "Heatmap of Gene Expression Across All Samples (Z-score)"
+)
+dev.off()
+cat("Figure 4 saved.\n")
+
+
+
+# STEP 11: FIGURE 5 — Heatmap of Mean Expression per Subtype
+
+
+cat("Generating Figure 5: Heatmap (mean per subtype)...\n")
+
+mean_heatmap <- mean_expr %>%
+  select(gene, subtype, mean_expr) %>%
+  pivot_wider(names_from = subtype, values_from = mean_expr) %>%
+  as.data.frame()
+
+rownames(mean_heatmap) <- mean_heatmap$gene
+mean_heatmap$gene <- NULL
+mean_matrix <- as.matrix(mean_heatmap)
+
+# Scale
+mean_scaled <- t(scale(t(mean_matrix)))
+
+png("figures/Figure5_Heatmap_MeanSubtype.png", width = 7, height = 5,
+    units = "in", res = 300)
+pheatmap(
+  mean_scaled,
+  cluster_rows  = TRUE,
+  cluster_cols  = FALSE,
+  fontsize_row  = 12,
+  fontsize_col  = 11,
+  color         = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  main          = "Mean Gene Expression per Subtype (Z-score Scaled)"
+)
+dev.off()
+cat("Figure 5 saved.\n")
+
+
+
+# STEP 12: FIGURES 6–11 — Volcano Plots (One per Contrast)
+
+
+cat("Generating Figures 6-11: Volcano plots...\n")
+
+volcano_contrasts <- list(
+  list(name = "LumB_vs_LumA",  title = "Luminal B vs Luminal A",         fig = 6),
+  list(name = "HER2_vs_LumA",  title = "HER2-Enriched vs Luminal A",     fig = 7),
+  list(name = "TNBC_vs_LumA",  title = "Triple-Negative vs Luminal A",   fig = 8),
+  list(name = "HER2_vs_LumB",  title = "HER2-Enriched vs Luminal B",     fig = 9),
+  list(name = "TNBC_vs_LumB",  title = "Triple-Negative vs Luminal B",   fig = 10),
+  list(name = "TNBC_vs_HER2",  title = "Triple-Negative vs HER2-Enriched", fig = 11)
+)
+
+for (vc in volcano_contrasts) {
+  
+  res <- results_list[[vc$name]]
+  
+  # Classify genes
+  res$significance <- "Not Significant"
+  res$significance[res$logFC >  1 & res$adj.P.Val < 0.05] <- "Upregulated"
+  res$significance[res$logFC < -1 & res$adj.P.Val < 0.05] <- "Downregulated"
+  res$significance <- factor(res$significance,
+                              levels = c("Upregulated", "Downregulated",
+                                         "Not Significant"))
+  
+  sig_colors <- c(
+    "Upregulated"     = "#E53935",
+    "Downregulated"   = "#1E88E5",
+    "Not Significant" = "grey60"
+  )
+  
+  vp <- ggplot(res, aes(x = logFC, y = -log10(adj.P.Val),
+                         color = significance, label = gene)) +
+    geom_point(size = 3, alpha = 0.85) +
+    geom_text_repel(size = 3.5, fontface = "bold", max.overlaps = 20) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed",
+               color = "grey40", linewidth = 0.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               color = "grey40", linewidth = 0.5) +
+    scale_color_manual(values = sig_colors) +
+    labs(
+      title    = paste("Volcano Plot:", vc$title),
+      subtitle = "Dashed lines: |logFC| = 1, adjusted p-value = 0.05",
+      x        = "Log2 Fold Change",
+      y        = "-log10 (Adjusted P-value)",
+      color    = "Expression"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 13),
+      legend.position = "right"
+    )
+  
+  filename <- paste0("figures/Figure", vc$fig, "_Volcano_", vc$name, ".png")
+  ggsave(filename, vp, width = 8, height = 6, dpi = 300)
+  cat("Figure", vc$fig, "saved:", filename, "\n")
+}
+
+
+
+# STEP 13: FIGURE 12 — LogFC Summary Heatmap Across All Contrasts
+
+# --- Heatmap: build consistent logFC matrix and save PNG
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+# Ensure results_list exists; if not, try to load CSV
+if (!exists("results_list")) {
+  if (file.exists("data/DGE_Results_All_Contrasts.csv")) {
+    dge_all <- read.csv("data/DGE_Results_All_Contrasts.csv", stringsAsFactors = FALSE)
+    results_list <- split(dge_all, dge_all$contrast)
+    for (nm in names(results_list)) {
+      results_list[[nm]]$gene <- as.character(results_list[[nm]]$gene)
+      rownames(results_list[[nm]]) <- results_list[[nm]]$gene
+      results_list[[nm]]$logFC <- as.numeric(results_list[[nm]]$logFC)
+      results_list[[nm]]$adj.P.Val <- as.numeric(results_list[[nm]]$adj.P.Val)
+    }
+  } else {
+    stop("No results_list in memory and no data/DGE_Results_All_Contrasts.csv found.")
+  }
+}
+
+# Build logFC matrix (rows = genes, cols = contrasts)
+all_genes <- unique(unlist(lapply(results_list, function(x) x$gene)))
+contrast_names <- names(results_list)
+logfc_matrix <- matrix(NA_real_, nrow = length(all_genes), ncol = length(contrast_names),
+                       dimnames = list(all_genes, contrast_names))
+for (ct in contrast_names) {
+  res <- results_list[[ct]]
+  res$logFC <- as.numeric(res$logFC)
+  rownames(res) <- res$gene
+  logfc_matrix[rownames(res), ct] <- res$logFC
+}
+
+# Put your six target genes first (if present)
+target_genes <- c("TP53","CDK4","CCND1","BAX","BCL2","CASP3")
+target_order <- intersect(target_genes, rownames(logfc_matrix))
+other_genes  <- setdiff(rownames(logfc_matrix), target_order)
+logfc_matrix <- logfc_matrix[c(target_order, other_genes), , drop = FALSE]
+
+# Column annotation: number of significant genes per contrast (adj.P.Val < 0.05 & |logFC| > 1)
+sig_counts <- sapply(results_list, function(res) {
+  sum(!is.na(res$adj.P.Val) & res$adj.P.Val < 0.05 & abs(as.numeric(res$logFC)) > 1, na.rm = TRUE)
+})
+col_annotation <- data.frame(SignificantGenes = sig_counts)
+rownames(col_annotation) <- colnames(logfc_matrix)
+
+# Symmetric diverging palette centered at zero
+max_abs <- max(abs(logfc_matrix), na.rm = TRUE)
+if (!is.finite(max_abs) || max_abs == 0) max_abs <- 1
+breaks <- seq(-max_abs, max_abs, length.out = 101)
+palette <- colorRampPalette(c("#2166AC", "white", "#B2182B"))(length(breaks) - 1)
+
+# Plot and save heatmap
+png("figures/Figure12_LogFC_Summary_Heatmap.png", width = 10, height = 6, units = "in", res = 300)
+pheatmap::pheatmap(
+  logfc_matrix,
+  color = palette,
+  breaks = breaks,
+  na_col = "grey95",
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 11,
+  fontsize_col = 10,
+  annotation_col = col_annotation,
+  main = "Log2 Fold Change Across Subtype Comparisons"
+)
+dev.off()
+
+
+# STEP 14: Save Results Table as CSV
+
+
+cat("\nSaving results table...\n")
+
+write.csv(all_results,
+          file      = "data/DGE_Results_All_Contrasts.csv",
+          row.names = FALSE)
+
+write.csv(mean_expr,
+          file      = "data/Mean_Expression_Per_Subtype.csv",
+          row.names = FALSE)
+
+cat("Results saved to /data folder.\n")
+
+
+# STEP 15: Session Info (for Reproducibility)
+
+
+cat("\nSession Info\n")
+sessionInfo()
+
+cat("\n\n")
+cat("Analysis complete. All 12 figures saved to /figures folder.\n")
+cat("Results tables saved to /data folder.\n")
+cat("\n")
