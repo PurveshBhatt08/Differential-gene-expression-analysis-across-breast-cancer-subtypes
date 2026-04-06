@@ -14,6 +14,6 @@ This project performs differential gene expression analysis across  four breast 
 ![combined volcano plots](Volvano_combined.png)
 ### Heatmap
 ![Heatmap](heatmap.png)
-##Future prospects 
+###Future prospects 
 ![Extended bioinformatics analyses- exploring pathway enrichment of significant genes
 Look at genes ontology categories (biological process and molecular functions)
