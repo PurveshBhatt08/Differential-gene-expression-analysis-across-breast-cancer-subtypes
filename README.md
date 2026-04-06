@@ -16,5 +16,5 @@ This project performs differential gene expression analysis across  four breast 
 ![Heatmap](heatmap.png)
 
 ##Future prospects 
-![Extended bioinformatics analyses- exploring pathway enrichment of significant genes
-Look at genes ontology categories (biological process and molecular functions)
+*Extended bioinformatics analyses- exploring pathway enrichment of significant genes
+*Look at genes ontology categories (biological process and molecular functions)
